@@ -21,5 +21,5 @@ CREATE TABLE IF NOT EXISTS transactions (
 -- The password hash below corresponds to the plain text password: 'password123'
 -- Generated using bcrypt
 INSERT INTO users (username, password_hash, role) 
-VALUES ('admin', '$2a$10$7XvW792Y7A3k7B7B7B7B7OuVjXWpG1p9G9G9G9G9G9G9G9G9G9G9G', 'admin')
+VALUES ('admin', '$2a$10$dIDo0590nuP1Bjw5yRY.beiJrKqOmZ46z74IMC9B3N3H0E18xGKwW', 'admin')
 ON CONFLICT (username) DO NOTHING;

@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"sync"
 	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -29,6 +33,15 @@ type TransactionJob struct {
 type paymentServer struct {
 	paymentpb.UnimplementedPaymentServiceServer
 	jobQueue chan TransactionJob // Thread-safe queue channel
+}
+
+type SystemStats struct {
+	mu       sync.Mutex
+	Counters map[string]int // Thread-safe state registry
+}
+
+var Stats = &SystemStats{
+	Counters: make(map[string]int),
 }
 
 // 1. gRPC Interceptor (Middleware): Validates metadata tokens
@@ -73,7 +86,9 @@ func AuthUnaryInterceptor(authClient authpb.AuthServiceClient) grpc.UnaryServerI
 }
 
 // 2. Asynchronous Worker Pool: Background Goroutines executing payment operations
-func transactionWorker(workerID int, jobs <-chan TransactionJob) {
+func transactionWorker(workerID int, jobs <-chan TransactionJob, db *sql.DB, producer *kafka.Producer) {
+	topic := "payment_processed"
+
 	for job := range jobs {
 		// Implement structured Context checks to prevent handling abandoned client timeouts
 		select {
@@ -81,12 +96,43 @@ func transactionWorker(workerID int, jobs <-chan TransactionJob) {
 			job.errChan <- status.Error(codes.DeadlineExceeded, "request timed out inside execution queue")
 			continue
 		default:
-			// Simulate communicating with a third-party credit card gateway
-			time.Sleep(200 * time.Millisecond)
+			// 1. Core Transaction Execution
+			time.Sleep(100 * time.Millisecond)
 
 			txID := fmt.Sprintf("tx_id_w%d_%d", workerID, time.Now().UnixNano())
 
-			// Send response back using individual response channels
+			// 2. Commit Transaction Row to DB
+			dbCtx, dbCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_, dbErr := db.ExecContext(dbCtx,
+				"INSERT INTO transactions (id, user_id, amount, currency, status) VALUES ($1, $2, $3, $4, $5)",
+				txID, 1, job.request.Amount, job.request.Currency, "COMPLETED",
+			)
+			dbCancel()
+			if dbErr != nil {
+				log.Printf("[WORKER %d] DB commit error: %v", workerID, dbErr)
+			}
+
+			// 3. Dispatch Message Event into Kafka Stream
+			payload := fmt.Sprintf("Processed transaction: %s for %0.2f %s", txID, job.request.Amount, job.request.Currency)
+			if err := producer.Produce(&kafka.Message{
+				TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+				Key:            []byte(txID),
+				Value:          []byte(payload),
+			}, nil); err != nil {
+				log.Printf("[WORKER %d] Confluent production enqueue fault: %v", workerID, err)
+			} else {
+				log.Printf("[WORKER %d] Message enqueued for event streaming: %s", workerID, txID)
+			}
+			producer.Flush(10)
+
+			// 4. Safely Update Metrics Registry Map using sync.Mutex
+			Stats.mu.Lock()
+			Stats.Counters["total_processed_payments"]++
+			Stats.Counters[fmt.Sprintf("worker_%d_jobs", workerID)]++
+			log.Printf("[MUTEX STATUS] Total global processing score updated safely to: %d", Stats.Counters["total_processed_payments"])
+			Stats.mu.Unlock()
+
+			// Send response status back using response channels
 			job.resultChan <- &paymentpb.PaymentResponse{
 				TransactionId: txID,
 				Status:        "SUCCESSFUL_SETTLEMENT",
@@ -95,7 +141,22 @@ func transactionWorker(workerID int, jobs <-chan TransactionJob) {
 	}
 }
 
-// 3. Core Service Method:: Handled purely by passing payload to background threads
+// 3. LISTEN FOR ASYNCHRONOUS KAFKA DELIVERY EVENTS
+func listenToKafkaDeliveryReports(producer *kafka.Producer) {
+	for e := range producer.Events() {
+		switch ev := e.(type) {
+		case *kafka.Message:
+			if ev.TopicPartition.Error != nil {
+				log.Printf("[KAFKA COURIER] Transmission error: %v", ev.TopicPartition.Error)
+			} else {
+				log.Printf("[KAFKA COURIER] Confirmed network ack received on partition %d for key %s",
+					ev.TopicPartition.Partition, string(ev.Key))
+			}
+		}
+	}
+}
+
+// 4. Core Service Method:: Handled purely by passing payload to background threads
 func (s *paymentServer) ProcessPayment(ctx context.Context, req *paymentpb.PaymentRequest) (*paymentpb.PaymentResponse, error) {
 	// Establish a strict overall transaction window processing timeout (3 seconds)
 	txCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -127,13 +188,15 @@ func (s *paymentServer) ProcessPayment(ctx context.Context, req *paymentpb.Payme
 	case err := <-errChan:
 		return nil, err
 	case <-txCtx.Done():
-		return nil, status.Error(codes.DeadlineExceeded, "upstream latency processing timeout exceeded")
+		return nil, status.Error(codes.DeadlineExceeded, "latency timeout error")
 	}
 }
 
 func main() {
 	port := os.Getenv("PAYMENT_PORT")
 	authAddr := os.Getenv("AUTH_SERVICE_ADDR")
+	dbURL := os.Getenv("DATABASE_URL")
+	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
 
 	// 1. Establish insecure network client connection channel to Auth cluster node
 	conn, err := grpc.NewClient(authAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -143,20 +206,36 @@ func main() {
 	defer conn.Close()
 	authClient := authpb.NewAuthServiceClient(conn)
 
-	// 2. Initialize Buffered Concurrency Job Channels
-	queueSize := 500
-	jobQueue := make(chan TransactionJob, queueSize)
+	// 2. Initialize Postgres Driver SQL Pool
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("Fatal: Database initialization error: %v", err)
+	}
+	defer db.Close()
 
-	// 3. Spawn Worker Pools using multiple Goroutines
-	workerPoolSize := 5
-	for w := 1; w <= workerPoolSize; w++ {
-		go transactionWorker(w, jobQueue)
+	// 3. Initialize Official Confluent Kafka Producer Instance
+	producer, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers": kafkaBrokers,
+		"client.id":         "gateway_payment_producer",
+		"acks":              "all",
+	})
+	if err != nil {
+		log.Fatalf("Fatal: Kafka client exception: %v", err)
+	}
+	defer producer.Close()
+
+	// Spawn delivery background routine tracking acks off Kafka event loops channel
+	go listenToKafkaDeliveryReports(producer)
+
+	// 4. Start Pipeline Channels & Goroutine Worker Pools
+	jobQueue := make(chan TransactionJob, 500)
+	for w := 1; w <= 5; w++ {
+		go transactionWorker(w, jobQueue, db, producer)
 	}
 
-	// 4. Bind and Listen on TCP Port
 	lis, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		log.Fatalf("Critical: Failed to monitor payment port %s: %v", port, err)
+		log.Fatalf("Fatal: Network address bind exception: %v", err)
 	}
 
 	// 5. Register gRPC server containing the Middleware Interceptor handler
@@ -165,8 +244,37 @@ func main() {
 	)
 	paymentpb.RegisterPaymentServiceServer(grpcServer, &paymentServer{jobQueue: jobQueue})
 
-	log.Printf("SUCCESS: Payment Service Engine operational on port: %s", port)
+	log.Printf("Success: Payment Service Engine running on port: %s", port)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("Critical: Failed to boot Payment gRPC: %v", err)
 	}
+
+	// ─── THE GRACEFUL SHUTDOWN ROUTINE ──────────────────────────────────
+	// Start the gRPC server inside its own independent goroutine
+	// go func() {
+	// 	log.Printf("SUCCESS: Complete System Online. Monitoring port %s", port)
+	// 	if err := grpcServer.Serve(lis); err != nil {
+	// 		log.Printf("Server execution stopped: %v", err)
+	// 	}
+	// }()
+
+	// Create a channel to listen for incoming Linux OS terminal signals
+	// shutdownSignal := make(chan os.Signal, 1)
+	// signal.Notify(shutdownSignal, syscall.SIGINT, syscall.SIGTERM)
+
+	// This blocks main execution here until you press Ctrl+C or Docker stops the container
+	// <-shutdownSignal
+	// log.Println("[SHUTDOWN] Intercepted stop signal. Beginning graceful termination...")
+
+	// Stop accepting new gRPC requests instantly
+	// grpcServer.GracefulStop()
+	// log.Println("[SHUTDOWN] gRPC server stopped accepting new inbound connections.")
+
+	// Safely close our internal worker channel queue pipeline
+	// close(jobQueue)
+	// log.Println("[SHUTDOWN] Worker job queue channel closed successfully.")
+
+	// Allow Confluent Kafka to flush remaining messages out to the network wires
+	// producer.Flush(3000) // Gives the native client up to 3 seconds to clear its memory buffer
+	// log.Println("[SHUTDOWN] Confluent Kafka producer buffer flushed. Goodbye.")
 }

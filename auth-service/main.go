@@ -116,7 +116,7 @@ func main() {
 	grpcServer := grpc.NewServer()
 	pb.RegisterAuthServiceServer(grpcServer, &authServer{db: db, rdb: rdb})
 
-	log.Printf("Success: Auth Service running securely on port: %s", port)
+	log.Printf("Success: Auth Service running on port: %s", port)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("Critical: Failed to serve gRPC: %v", err)
 	}

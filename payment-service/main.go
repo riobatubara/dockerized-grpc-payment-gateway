@@ -31,7 +31,7 @@ type paymentServer struct {
 	jobQueue chan TransactionJob // Thread-safe queue channel
 }
 
-// 1. gRPC INTERCEPTOR (MIDDLEWARE): Validates metadata tokens
+// 1. gRPC Interceptor (Middleware): Validates metadata tokens
 func AuthUnaryInterceptor(authClient authpb.AuthServiceClient) grpc.UnaryServerInterceptor {
 	return func(
 		ctx context.Context,
@@ -39,7 +39,6 @@ func AuthUnaryInterceptor(authClient authpb.AuthServiceClient) grpc.UnaryServerI
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
 	) (interface{}, error) {
-		// Extract incoming metadata (metadata maps directly to transport headers)
 		md, ok := metadata.FromIncomingContext(ctx)
 		if !ok {
 			return nil, status.Error(codes.Unauthenticated, "metadata headers are missing")
@@ -49,19 +48,19 @@ func AuthUnaryInterceptor(authClient authpb.AuthServiceClient) grpc.UnaryServerI
 		if len(tokens) == 0 || tokens[0] == "" {
 			return nil, status.Error(codes.Unauthenticated, "authorization token is missing")
 		}
-		tokenString := tokens[0]
+		tokenString := tokens[0] // Correctly reading index 0 string fragment
 
-		// Call the independent Auth microservice using its gRPC client link
-		authCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		// Create a clean background context for internal communication
+		authCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
 		authRes, err := authClient.Authorize(authCtx, &authpb.AuthorizeRequest{
 			Token:        tokenString,
-			RequiredRole: "admin", // Requires 'admin' role context for transactions
+			RequiredRole: "admin", // Match the database row string value exactly
 		})
 
 		if err != nil {
-			log.Printf("Auth connection error: %v", err)
+			log.Printf("[Middleware Error] gRPC dial call to Auth Service failed: %v", err)
 			return nil, status.Error(codes.Internal, "security authorization check failed")
 		}
 
@@ -69,12 +68,11 @@ func AuthUnaryInterceptor(authClient authpb.AuthServiceClient) grpc.UnaryServerI
 			return nil, status.Error(codes.Unauthenticated, "access denied: insufficient permissions")
 		}
 
-		// Authorization complete, pass the call down to the core service handler
 		return handler(ctx, req)
 	}
 }
 
-// 2. ASYNCHRONOUS WORKER POOL: Background Goroutines executing payment operations
+// 2. Asynchronous Worker Pool: Background Goroutines executing payment operations
 func transactionWorker(workerID int, jobs <-chan TransactionJob) {
 	for job := range jobs {
 		// Implement structured Context checks to prevent handling abandoned client timeouts
@@ -97,7 +95,7 @@ func transactionWorker(workerID int, jobs <-chan TransactionJob) {
 	}
 }
 
-// 3. CORE SERVICE METHOD: Handled purely by passing payload to background threads
+// 3. Core Service Method:: Handled purely by passing payload to background threads
 func (s *paymentServer) ProcessPayment(ctx context.Context, req *paymentpb.PaymentRequest) (*paymentpb.PaymentResponse, error) {
 	// Establish a strict overall transaction window processing timeout (3 seconds)
 	txCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -138,7 +136,7 @@ func main() {
 	authAddr := os.Getenv("AUTH_SERVICE_ADDR")
 
 	// 1. Establish insecure network client connection channel to Auth cluster node
-	conn, err := grpc.Dial(authAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(authAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("Critical: Could not connect to auth cluster link: %v", err)
 	}

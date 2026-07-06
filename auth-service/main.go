@@ -26,7 +26,7 @@ type authServer struct {
 	rdb *redis.Client
 }
 
-// 1. LOGIN METHOD: Checks Postgres and stores session in Redis
+// 1. Login Method: Checks Postgres and stores session in Redis
 func (s *authServer) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResponse, error) {
 	// Use Context with a clear database timeout limit (3 seconds)
 	dbCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -38,18 +38,14 @@ func (s *authServer) Login(ctx context.Context, req *pb.LoginRequest) (*pb.Login
 
 	// Query Postgres to look for the username
 	query := "SELECT id, password_hash, role FROM users WHERE username = $1"
-	err := s.db.QueryRowContext(dbCtx, query, req.Username).Scan(&userID, &passwordHash, &userRole)
-
-	if err == sql.ErrNoRows {
-		return nil, status.Error(codes.Unauthenticated, "invalid username or password")
-	} else if err != nil {
+	if err := s.db.QueryRowContext(dbCtx, query, req.Username).Scan(&userID, &passwordHash, &userRole); err != nil {
 		log.Printf("Postgres Error: %v", err)
 		return nil, status.Error(codes.Internal, "database error")
+	} else if err == sql.ErrNoRows {
+		return nil, status.Error(codes.Unauthenticated, "invalid username or password")
 	}
 
-	// Cryptographically verify the plain text password against the stored bcrypt hash
-	err = bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password))
-	if err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
 		return nil, status.Error(codes.Unauthenticated, "invalid username or password")
 	}
 
@@ -60,8 +56,7 @@ func (s *authServer) Login(ctx context.Context, req *pb.LoginRequest) (*pb.Login
 	redisCtx, redisCancel := context.WithTimeout(ctx, 2*time.Second)
 	defer redisCancel()
 
-	err = s.rdb.Set(redisCtx, sessionToken, userRole, 1*time.Hour).Err()
-	if err != nil {
+	if err := s.rdb.Set(redisCtx, sessionToken, userRole, 1*time.Hour).Err(); err != nil {
 		log.Printf("Redis Error: %v", err)
 		return nil, status.Error(codes.Internal, "failed to create user session cache")
 	}
@@ -69,7 +64,7 @@ func (s *authServer) Login(ctx context.Context, req *pb.LoginRequest) (*pb.Login
 	return &pb.LoginResponse{Token: sessionToken}, nil
 }
 
-// 2. AUTHORIZE METHOD: Validates the token and verifies user role
+// 2. Authorize Method: Validates the token and verifies user role
 func (s *authServer) Authorize(ctx context.Context, req *pb.AuthorizeRequest) (*pb.AuthorizeResponse, error) {
 	redisCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -77,7 +72,7 @@ func (s *authServer) Authorize(ctx context.Context, req *pb.AuthorizeRequest) (*
 	// Fetch the role attached to this token from Redis cache
 	userRole, err := s.rdb.Get(redisCtx, req.Token).Result()
 	if err == redis.Nil {
-		// Session missing or expired
+		// token not found / expired
 		return &pb.AuthorizeResponse{Authorized: false}, nil
 	} else if err != nil {
 		log.Printf("Redis Error: %v", err)

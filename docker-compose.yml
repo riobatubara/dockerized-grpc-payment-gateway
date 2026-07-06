@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: gateway_postgres
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - gateway_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: gateway_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    networks:
+      - gateway_network
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: ./auth-service/Dockerfile
+    container_name: gateway_auth_service
+    environment:
+      AUTH_PORT: ${AUTH_PORT}
+      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}?sslmode=disable
+      REDIS_ADDR: redis:6379
+    ports:
+      - "${AUTH_PORT}:${AUTH_PORT}"
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - gateway_network
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: ./payment-service/Dockerfile
+    container_name: gateway_payment_service
+    environment:
+      PAYMENT_PORT: ${PAYMENT_PORT}
+      AUTH_SERVICE_ADDR: auth-service:${AUTH_PORT}
+    ports:
+      - "${PAYMENT_PORT}:${PAYMENT_PORT}"
+    depends_on:
+      - auth-service
+    networks:
+      - gateway_network
+
+networks:
+  gateway_network:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:

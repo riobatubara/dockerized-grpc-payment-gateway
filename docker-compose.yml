@@ -1,4 +1,28 @@
 services:
+  kafka:
+    image: apache/kafka:latest
+    container_name: gateway_kafka
+    ports:
+      - "9092:9092"   # for other containers
+      - "29092:29092" # for your host machine
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_HOST://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "nc -z localhost 9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - gateway_network
+
   postgres:
     image: postgres:15-alpine
     container_name: gateway_postgres
@@ -48,11 +72,16 @@ services:
     container_name: gateway_payment_service
     environment:
       PAYMENT_PORT: ${PAYMENT_PORT}
+      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}?sslmode=disable
       AUTH_SERVICE_ADDR: auth-service:${AUTH_PORT}
+      KAFKA_BROKERS: ${KAFKA_BROKERS}
     ports:
       - "${PAYMENT_PORT}:${PAYMENT_PORT}"
     depends_on:
-      - auth-service
+      auth-service:
+        condition: service_started
+      kafka:
+        condition: service_healthy
     networks:
       - gateway_network
 

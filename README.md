@@ -13,17 +13,19 @@ go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 ```
 
 ### Compile Auth Definitions
+```
 protoc \
   --go_out=. \
   --go-grpc_out=. \
   proto/auth.proto
+```
 
 ### Compile Payment Definitions
 ```
 protoc \
   --go_out=. \
   --go-grpc_out=. \
-  proto/auth.proto
+  proto/payment.proto
 ```
 
 ### Compile Both Auth & Payment Definitions
@@ -35,16 +37,22 @@ protoc \
 ```
 
 ### Build both auth-service & payment service Dockerfile
+```
 docker compose --env-file .env up --build -d
+```
 
 ### Deploy all service without build
+```
 docker compose --env-file .env up -d
+```
 
 ### Check broadcast
+```
 docker exec -it gateway_kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server localhost:29092 \
   --topic payment_processed \
   --from-beginning
+```
 
 
 ### Running test
